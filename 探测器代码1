@@ -1,0 +1,709 @@
+/*******************************************************************************
+创建时间：	2023-01-31
+作者       ：  李宇杰：	
+修改部分:(1)数显探头， 
+********************************************************************************/
+
+
+
+/* 包含的头文件 --------------------------------------------------------------*/
+#include "bsp.h"
+#include "bsp_adc.h"
+#include "bsp_timer.h"
+#include "bsp_uart.h"
+#include "LCM.h"
+#include "define.h"
+#include "eeprom.h"
+#include "stdio.h"
+
+u16  time2_cnt = 0;
+u16  ADC_vale = 0;
+u8   Pre_time = 50;
+u8   Fuction=0;
+u16  Self_clear_count = 0;
+u8   Self_clear_flag = 0;
+u8   Reback_picture = 1;
+u16  ADC_sumdata[ADC_CN];
+u8   ADC_sumcnt;
+u8   ADC_FirstCheck;
+
+u8   time2_limit;
+u8   Address=0;
+u8   SendDown;//统筹通讯与ADC关系
+
+u16  Key_time=0;
+//状态标志位
+volatile u8 Fault_flag = 0;
+volatile u8 warning_flag = 0;   //报警标志
+volatile u8 Lalarm_flag = 0;
+volatile u8 Halarm_flag = 0;
+
+u16 LowAlarm_count = 0;
+u8  LowAlarm_flag = 0;
+
+u8  SendDown_count = 0;
+u8  SendDown_flag = 0;
+
+void IWDG_Initializes(void);
+
+/************************************************
+函数名称 ： System_Initializes
+功    能 ： 系统初始化
+参    数 ： 无
+返 回 值 ： 无
+作    者 ： 李宇杰
+*************************************************/
+void System_Initializes(void)
+{
+    CLK_Configuration();//配置系统时钟为外部16MHZ晶振
+    GPIO_Configuration();//配置I/O口
+    LCM_Init();//配置LCM屏初始化
+    ADC_Initializes();//配置ADC
+    UART_Initializes();//配置串口UART1为通讯口
+    MEEPROM_Init();
+    IWDG_Initializes();
+    enableInterrupts();
+}
+
+/************************************************
+函数名称 ： void Parameter_Init()
+功    能 ： 变量参数初始化
+参    数 ： 无
+返 回 值 ： 无
+作    者 ： 李宇杰
+*************************************************/
+void Parameter_Init()
+{
+    u8 i;
+    Pre_time = 120;
+    time2_cnt=0;
+    time2_limit=20;
+    //NongDu_update=0;
+    NongDu_Show=0;
+    Self_clear_flag = 0;//
+    Gain_size =DemoGain;
+    ADC_clear=DemoClear;
+    for(i=0;i<UART1_RTx_LEN;i++)
+    {
+       USART1_Rxd_Buff[i]=0;
+       USART1_Txd_Buff[i]=0;
+    }
+    for(i=0;i<ADC_CN;i++)
+    {
+       ADC_sumdata[i]=0;
+    }
+    ADC_sumcnt=0;
+    USART1_Cnt_Rxd=0;
+    SendDown=0;
+    SendDown_flag=0;
+    key_val=0;
+    ADC_FirstCheck=0;
+    Gain_NDcheck=0;
+}
+
+/**********************************************************
+** 函数名:void EEPROM_READ()
+** 功能描述:读取eeprom存储的信息
+** 输入参数: 无
+** 输出参数：无
+** 备    注：(1)读取探头通讯ID号、探头类型、对应类型气体的低报和高报值
+             (2)探头显示范围为0~999，所以设置参数不可能超过1000
+***********************************************************/
+void EEPROM_READ()
+{
+    u8 data_l,data_h;
+    Address_ID=MEEPROM_ReadByte(ID_Addr);//读取探头ID号
+    if((Address_ID>64)||(Address_ID==0))
+        Address_ID=1;
+    Address=Address_ID; 
+    
+    data_h=MEEPROM_ReadByte(Gas_Addr);
+    data_l=MEEPROM_ReadByte(Gas_Addr+1);
+    Gain_size =(u16)(data_h<<8)|data_l; 
+    if((Gain_size >9999)||(Gain_size ==0))
+        Gain_size =DemoGain;
+    
+    data_h=MEEPROM_ReadByte(Clear_Addr);
+    data_l=MEEPROM_ReadByte(Clear_Addr+1);
+    ADC_clear=(u16)(data_h<<8)|data_l; 
+    if((ADC_clear>9999)||(ADC_clear==0))
+      ADC_clear=DemoClear;
+}						
+/************************************************
+函数名称 ： IWDG_Initializes
+功    能 ： 看门狗初始化
+参    数 ： 无
+返 回 值 ： 无
+说    明 ： 看门狗复位时钟：250/（128KHZ/256）=0.5s
+*************************************************/
+void IWDG_Initializes(void)
+{
+  if(RST_GetFlagStatus(RST_FLAG_IWDGF))
+  {
+     RST_ClearFlag(RST_FLAG_IWDGF);
+  }
+ IWDG_Enable(); //使能看门狗                                
+  IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);  //允许写分频值和重载值
+  IWDG_SetPrescaler(IWDG_Prescaler_256);         //分频值
+  IWDG_SetReload(250);                           //重载值(8位寄存器 最大255)
+  IWDG_ReloadCounter();                          //重载计数值
+  
+}
+
+//喂独立看门狗
+/************************************************
+函数名称 ： void IWDG_Feed(void)
+功    能 ： 看门狗喂狗
+参    数 ： 无
+返 回 值 ： 无
+说    明 ： 
+*************************************************/
+void IWDG_Feed(void)
+{   
+   IWDG_ReloadCounter();   //重载计数值										   
+}
+
+
+/*******************************************************************************
+***	函数名称:	u16 calculate_CRC(u8 *p,u8 count)
+***	函数功能:	通信数据CRC校验码计算函数
+***	入口参数:	*p：校验数组指针;
+***           count:校验数组长度
+***	返回参数:	无
+*** 备注:     无
+*******************************************************************************/
+u16 calculate_CRC(u8 *p,u8 count)
+{
+  u8 i,j;
+  u16 CRC_register=0xffff;
+  for(i=0;i<count;i++)
+  {
+    CRC_register^=p[i];
+    for(j=0;j<8;j++)
+    {
+      if(CRC_register&0x01)
+      {
+        CRC_register>>=1;
+	      CRC_register^=0xa001;
+      }
+      else
+      {
+        CRC_register>>=1;
+      }
+    }
+  }
+  return CRC_register; 
+}
+/************************************************
+函数名称 ： main
+功    能 ： 主函数入口
+参    数 ： 无
+返 回 值 ： 无
+作    者 ： strongerHuang
+*************************************************/
+void main()
+{
+    u8 GetKeyNum,i;
+    u8 data_h,data_l;
+    u32 datanongdu=0;
+    Parameter_Init();
+    System_Initializes(); 
+    EEPROM_READ();//从E2PROM中读取存储的参数	
+    TIMER2_Initializes();//time2初始化,10ms进入一次中断
+    Fuction=PreHeat;
+    while(Pre_time>0)
+    {
+       LCM_ShowData(Pre_time);
+       USART1_Txd_Buff[0] = Address;
+       USART1_Txd_Buff[1] = 0xAA;
+       USART1_Txd_Buff[2]=0x00;
+       IWDG_Feed();
+       if(KEY3==0)//当按下↑按键时跳出预热
+       {
+          Pre_time=0;
+          key_val=0;
+       }
+    }
+    Fuction=Monitor;
+    ADC_FirstCheck=1;
+    time2_cnt=0; 
+    do
+    {
+      Address=Address_ID;
+      IWDG_Feed();
+      if(Fuction==Monitor)//采集阶段
+      {
+          if(SendDown_count>10)
+          {
+              SendDown_count=0;
+              SendDown=0;
+              SendDown_flag=0;
+          }
+          TIM2_ITConfig(TIM2_IT_UPDATE, DISABLE);//禁止10ms中断
+          if(SendDown==0)
+          {
+             ADC_vale=ADC_Read(ADC2_CHANNEL_0);//采集ADC有均值，
+          }
+          TIM2_ITConfig(TIM2_IT_UPDATE, ENABLE);//开启10ms中断
+          if((ADC_vale<400)||(ADC_vale>6000))//当传感器信号电压低于0.2V或高于3V
+          {
+            Dis_NongDu=0xffff;
+            time2_limit=1;
+          }
+          else
+          {
+               datanongdu=0;
+               if(ADC_clear>=ADC_vale)//当设置的气体清零值大于ADC采集值时，浓度=(零飘-采集值)/(增益)
+              {
+                  datanongdu =(u32)(ADC_clear-ADC_vale)*POT_MULT;
+                  delay_us(1);
+                  datanongdu=(u32)datanongdu/Gain_size ;
+              }
+              else
+              {
+                  datanongdu =(u32)(ADC_vale-ADC_clear)*POT_MULT;
+                  delay_us(1);
+                  datanongdu=(u32)datanongdu/Gain_size ;
+              }
+              ADC_sumdata[ADC_sumcnt]=datanongdu;
+              ADC_sumcnt++;
+              if(ADC_sumcnt>ADC_CN)//采集浓度累加求均值
+              {
+                ADC_sumcnt=0;
+                datanongdu=Bubble_Density(ADC_sumdata,ADC_CN)/Bubble_mult;//
+                if(datanongdu>=OUT_RANGE)//当气体浓度超量程
+                {
+                    Dis_NongDu = OUT_RANGE;//气体浓度为量程上限值
+                }
+                else{
+                    Dis_NongDu=Calculate_LEL(datanongdu,0);
+                }
+                //NongDu_update=1;
+                for(i=0;i<ADC_CN;i++)
+                {
+                   ADC_sumdata[i]=0;
+                }
+                if(Dis_NongDu>=Lalarm_size_Array)
+                  time2_limit=3;
+                else
+                  time2_limit=5;
+              }    
+           }
+          //if((NongDu_update==1)||(time2_cnt>time2_limit))//计算刷新数据后进入1次，
+           if(time2_cnt>time2_limit)//计算刷新数据后进入1次，
+          {
+              time2_cnt=0;
+              if(Dis_NongDu==0)
+              {
+                 if(NongDu_Show>5)
+                   NongDu_Show--;
+                 else 
+                   NongDu_Show=Dis_NongDu;
+              }
+              else if(Dis_NongDu==0xffff)
+              {
+                  Lalarm_flag = 0;
+                  Halarm_flag = 0;
+                  Fault_flag = 1;
+                  warning_flag = 0;
+              }
+              else {
+                  if(NongDu_Show<Dis_NongDu)
+                  {
+                      NongDu_Show++;
+                  }
+                  else if(NongDu_Show>Dis_NongDu)
+                  {
+                      NongDu_Show--;
+                  }
+              }
+              if(Dis_NongDu==0xffff)
+              {
+                  NongDu_Show=0x00;
+              }
+              else{
+                  if((NongDu_Show>=OUT_RANGE)&&(Dis_NongDu<0xffff))
+                  {
+                      NongDu_Show = OUT_RANGE;//浓度极限值为100%LEL
+                      Fault_flag = 1;
+                      warning_flag = 0;
+                      Lalarm_flag = 0;
+                      Halarm_flag = 0;
+                  }
+                  else if(NongDu_Show>=Halarm_size_Array)//或当气体浓度高于高报阈值时
+                  {
+                      Fault_flag = 0;
+                      warning_flag = 1;
+                      Halarm_flag = 1;
+                      
+                  }
+                  else if(NongDu_Show>=Lalarm_size_Array)//或者当气体浓度高于低报阈值时
+                  {
+                      Fault_flag = 0;
+                      warning_flag = 1;
+                      Lalarm_flag = 1;
+                      Halarm_flag = 0;
+                  }
+                  else if(NongDu_Show<Lalarm_size_Array)//或当气体浓度低于低报阈值时
+                  {
+                      Fault_flag = 0;
+                      warning_flag = 0;
+                      Lalarm_flag = 0;
+                      Halarm_flag = 0;
+                     
+                      if((Dis_NongDu>0)&&(Dis_NongDu<=5))//当气体浓度值为1~5时
+                      {
+                          Self_clear_flag = 1;//使能TIME2计数器中断中累加器
+                          if((Self_clear_count>=360)||(ADC_FirstCheck==1))
+                          {
+                              ADC_clear = ADC_vale;//读取此时ADC采集值并作为零飘值
+                              data_h=ADC_clear/256;
+                              MEEPROM_WriteByte(Clear_Addr,data_h);//存零漂值高8位
+                              data_l=ADC_clear%256;
+                              MEEPROM_WriteByte(Clear_Addr+1,data_l);//存对应气体零漂值低8位
+                              Self_clear_flag = 0;//停止累加
+                              Self_clear_count=0;
+                              ADC_FirstCheck=0;
+                          }
+                          if(Dis_NongDu<=1)
+                          {
+                            Dis_NongDu=0;
+                            NongDu_Show=Dis_NongDu;
+                          }
+                      }else if((Dis_NongDu==0)||(Dis_NongDu>5))
+                      {
+                          Self_clear_flag = 0;//当气体浓度值为0或者大于5，则不进行300s等待计算零飘值
+                      }
+                  }
+              }
+              USART1_Txd_Buff[0] = Address;
+              USART1_Txd_Buff[1] = 0xAA;
+              if(Fault_flag==1)//当发生故障时
+              {
+                  LCM_ShowChar(Seg_F);//显示故障信息FFF
+                  LEDR_OFF;
+                  LEDY_ON;
+                  LEDG_OFF;
+                  LowAlarm_flag=0;
+                  LowAlarm_count=0;
+                  USART1_Txd_Buff[2] = 0xff;
+              }
+              else//探头没有故障时
+              {
+                  if(warning_flag==1)//当发生报警时
+                  {
+                      if(Lalarm_flag==1)//当发生低报时
+                      {
+                          SOUND_ON;
+                          LowAlarm_flag=1;
+                          LEDY_OFF;
+                          LEDG_OFF;
+                        
+                      }
+                      if(Halarm_flag==1)//当发生高报时
+                      {
+                          RELAY_ON;
+                          SOUND_ON; 
+                          LowAlarm_flag=0;
+                          LowAlarm_count=0;
+                          LEDR_ON;
+                          LEDY_OFF;
+                          LEDG_OFF;
+                      }
+                  }
+                  else if(warning_flag==0)//非报警状态
+                  {
+                      RELAY_OFF;
+                      SOUND_OFF; 
+                      LEDR_OFF;
+                      LEDY_OFF;
+                      LEDG_ON;
+                      LowAlarm_flag=0;
+                      LowAlarm_count=0;
+
+                  }
+                  LCM_ShowData(NongDu_Show);
+                  USART1_Txd_Buff[2] = NongDu_Show;
+              }
+          }//end if(time2_cnt>time2_limit)
+          Key_time=50;
+      }//end if(Fuction==Monitor)  
+      else{
+          Key_time=10;
+      }
+      if(KEY3==0)//key3按下
+      {
+        key3.flag=1;
+      }	
+      else{
+        key3.flag=0;
+      }
+      if(KEY4==0)//key4按下
+      {
+        key4.flag=1;
+      }
+      else{
+        key4.flag=0;
+      }		
+      if(KEY2==0)//当按下key2
+      {
+        key2.flag=1;
+      }	
+      else{
+        key2.flag=0;
+      }
+      if(KEY1==0)//当按下key1键
+      {
+        key1.flag=1;
+      }	
+      else{
+        key1.flag=0;
+      }		
+      key_val=0;
+      if(key1.count>Key_time)
+      {
+         key1.flag=0;
+         key1.count=0;
+         if(Fuction==Monitor)//采集阶段
+         {
+            key_val = Key_Gain;//配置增益
+         }
+         else{
+            key_val = Key_Return;//返回功能
+         }        
+      }
+      if(key2.count>Key_time)//
+      {
+         key2.flag=0;
+         key2.count=0;
+         if(Fuction==Monitor)//采集阶段
+         {
+            key_val = Key_Clear;//配置零点
+         }
+         else{
+            key_val = Key_Confirm;//确定功能
+         }
+      }
+      if(key3.count>Key_time)//↑键
+      {
+         key3.flag=0;
+         key3.count=0;
+         if(Fuction==Monitor)//采集阶段
+         {
+            key_val = Key_Addr;//配置ID
+         }
+         else{
+            key_val = Key_Up;//↑功能
+         }
+      }
+      if(key4.count>Key_time)//↓键
+      {
+         key4.flag=0;
+         key4.count=0;
+         if(Fuction==Monitor)//采集阶段
+         {
+            key_val = Key_ReSet;//恢复出厂设置
+         }
+         else{
+            key_val = Key_Down;//↓功能
+         }
+      }
+      if(Fuction==Monitor)//采集阶段
+      {
+        if(Reback_picture==1)//当此时为菜单返回到采集界面时
+        {
+            LCM_clr();
+            time2_cnt=0;
+            Reback_picture = 0; 
+            LCM_ShowData(NongDu_Show);
+        }
+
+        if(LowAlarm_count>20)
+        {
+           LowAlarm_count=0;
+           LEDR_REVERSE;//红灯闪屏
+        }
+        if(key_val!= 0x00)//按下功能按键，进入菜单功能
+        {
+            GetKeyNum = key_val;
+            key_val=0;
+            time2_cnt=0;
+            switch(GetKeyNum)//进入不同功能界面判断
+            {
+              case Key_Addr:
+                Fuction=AddrSet;
+                LCM_ShowChar(Seg_A);//显示AAA
+                delay_ms(200);
+                break;
+              case Key_Clear:
+                Fuction=ClearSet;
+                LCM_ShowChar(Seg_C);//显示CCC
+                delay_ms(200);
+                break;
+              case Key_Gain:
+                Fuction=GainSet;
+                LCM_ShowChar(Seg_P);//显示PPP
+                delay_ms(200);
+                break;
+              case Key_ReSet:
+                Fuction=ResetSet;
+                LCM_ShowChar(Seg_H);//显示HHH
+                delay_ms(200);
+                break;
+              default:
+                break;
+            }
+            if(Fuction>Monitor)
+              EnterMenu();
+        }
+      }//end if(Fuction==Monitor)//采集阶段
+      else{//此时为菜单配置相关界面
+        ChangeMenu();
+      }
+    }while(1);
+}
+
+#ifdef USE_FULL_ASSERT                           //断言(参考官方)
+
+void assert_failed(u8* file, u32 line)
+{
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+
+  /* Infinite loop */
+  while (1)
+  {
+    break;
+  }
+}
+#endif
+
+/*-----------------------中断函数 --------------------------------------------------------------*/
+/************************************************
+函数名称 ： INTERRUPT_HANDLER(ITC_IRQ_Handler,ITC_IRQ_TIM4_OVF)
+功    能 ： TIME4超时进入中断
+参    数 ： 无
+返 回 值 ： 无
+说    明 ：(1) 8位TIME，配置20ms进入一次中断
+*************************************************/
+#pragma vector=13+2
+__interrupt void TIM2_IRQ()
+{ 
+   if(Fuction==PreHeat)//预热阶段
+   {
+       time2_cnt++;
+       if(time2_cnt>80)
+       {
+         Pre_time--;
+         if(Pre_time<2)
+           Pre_time=0;
+         time2_cnt=0;
+       }
+   }
+   else if(Fuction==Monitor)//监控时每110ms 累加1次
+   {
+     time2_cnt++;
+     if(SendDown_flag == 1)
+     {
+         SendDown_count++;
+     }
+     else if(SendDown_flag == 0)
+     {
+         SendDown_count = 0;
+     }
+   }
+   else//功能界面时返回上一级
+   {
+     time2_cnt++;
+     if(time2_cnt>240)//600s内无按键操作
+     {
+       time2_cnt=0;
+        Pre_time--;
+        if(Pre_time<2)
+        {
+           Pre_time=0;
+           Fuction=Monitor;
+           Reback_picture = 1;
+        }        
+     }
+   }
+   if(Self_clear_flag == 1)
+   {
+       Self_clear_count++;
+   }
+   else if(Self_clear_flag == 0)
+   {
+       Self_clear_count = 0;
+   }
+
+   if(LowAlarm_flag == 1)
+   {
+       LowAlarm_count++;
+   }
+   else if(LowAlarm_flag == 0)
+   {
+       LowAlarm_count = 0;
+   }
+   if(key1.flag==1)
+  {
+     key1.count++;
+  }
+  else{
+     key1.count=0;
+  }
+  if(key2.flag==1)
+  {
+     key2.count++;
+  }
+  else{
+     key2.count=0;
+  }
+  if(key3.flag==1)
+  {
+     key3.count++;
+  }
+  else{
+     key3.count=0;
+  }
+  if(key4.flag==1)
+  {
+     key4.count++;
+  }
+  else{
+     key4.count=0;
+  }
+   TIM2_ClearITPendingBit(TIM2_IT_UPDATE); //清中断标志位
+
+}
+/*
+#pragma vector=7+2
+__interrupt void EXTI_PORTE_IRQHandler(void)
+{
+
+}
+
+*/
+INTERRUPT_HANDLER(EXTI_PORTE_IRQHandler, 7)
+{
+   	
+}
+
+INTERRUPT_HANDLER(UART1_RX_IRQHandler, 18)
+{
+  u16 tempAddr=0;
+  if(UART1->SR&UART1_SR_OR)
+  {
+      UART1->SR &=~UART1_SR_OR;
+      UART1_ReceiveData9(); 
+  }
+  else if(UART1_GetITStatus(UART1_IT_RXNE )!= RESET)
+  {
+      UART1_ClearITPendingBit(UART1_IT_RXNE);
+      tempAddr=UART1_ReceiveData9();
+      
+      if(tempAddr==(Address|0x100))
+      {  
+          UART1_SendNByte(USART1_Txd_Buff,3);
+      }
+  }	
+}
